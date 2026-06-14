@@ -8,8 +8,3 @@ wheels/
 
 # Virtual environments
 .venv
-adapter/*
-instruction_adapter/*
-instruction_output/*
-processed_data/*
-output/*
