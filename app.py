@@ -31,9 +31,9 @@ st.markdown(
 )
 
 SIDEBAR_HELP = """
-- **Stage 1 (Non-Instruction):** Domain-adaptive pre-training on raw text via causal LM
-- **Stage 2 (Instruction):** Supervised fine-tuning on instruction-response pairs
-- **Stage 3 (Preference / DPO):** Align model behavior using preference data
+- **Stage 1 (Non-Instruction):** Domain-adaptive pre-training on raw text via causal LM → adapter `stage1`
+- **Stage 2 (Instruction):** Stack `stage1` (frozen) + new trainable LoRA → adapter `stage2`
+- **Stage 3 (Preference / DPO):** Stack `stage1+stage2` (frozen) + new trainable LoRA → adapter `stage3`
 """
 
 with st.sidebar:
@@ -88,8 +88,8 @@ if page == "Overview":
         st.markdown(
             "- **Goal:** Teach model to follow instructions\n"
             "- **Data:** Alpaca-style (instruction, input, output)\n"
-            "- **Method:** Continue training from Stage 1\n"
-            "- **Output:** Instruction-tuned LoRA adapter"
+            "- **Method:** Stack Stage 1 adapter (frozen) + new trainable LoRA\n"
+            "- **Output:** Instruction-tuned LoRA adapter (stage2)"
         )
 
     with col3:
@@ -97,18 +97,18 @@ if page == "Overview":
         st.markdown(
             "- **Goal:** Align model to preferred responses\n"
             "- **Data:** (prompt, chosen, rejected) triples\n"
-            "- **Method:** Direct Preference Optimization (DPO)\n"
-            "- **Output:** Preference-tuned LoRA adapter"
+            "- **Method:** Stack Stage 1+2 adapters (frozen) + new trainable LoRA\n"
+            "- **Output:** Preference-tuned LoRA adapter (stage3)"
         )
 
     st.divider()
 
     st.markdown("### Quick Start")
     st.markdown(
-        "1. **Stage 1:** Upload a PDF → extract text → train non-instruction LoRA\n"
-        "2. **Stage 2:** Provide instruction JSONL → train instruction LoRA (on Stage 1 base)\n"
-        "3. **Stage 3:** Provide preference JSONL → train DPO LoRA (on Stage 2 base)\n\n"
-        "Each stage saves its adapter independently. You can reuse adapters across sessions."
+        "1. **Stage 1:** Upload a PDF → extract text → train non-instruction LoRA (`stage1`)\n"
+        "2. **Stage 2:** Provide instruction JSONL → stack `stage1` (frozen) + new trainable LoRA (`stage2`)\n"
+        "3. **Stage 3:** Provide preference JSONL → stack `stage1` + `stage2` (frozen) + new trainable LoRA (`stage3`)\n\n"
+        "Each stage keeps adapters separate for compositional inference. All adapters compose at inference."
     )
 
 
@@ -213,11 +213,11 @@ elif page == "Stage 2: Instruction":
             instruction_config.gradient_accumulation_steps = st.number_input("Gradient Accumulation Steps", min_value=1, value=instruction_config.gradient_accumulation_steps, key="iaccum")
             instruction_config.adapter_dir = st.text_input("Adapter Output Directory", instruction_config.adapter_dir)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        stage1_adapter = st.text_input("Stage 1 Adapter Dir (optional)", value="")
-    with col2:
-        merged_model_dir = st.text_input("Merged Stage 1 Model Dir (optional)", value="")
+    stage1_adapter_dir = st.text_input(
+        "Stage 1 Adapter Directory (from non-instruction stage)",
+        value="./adapter",
+        help="Path to the non-instruction LoRA adapter from Stage 1. This adapter is loaded frozen; a new trainable adapter is added on top for instruction tuning.",
+    )
 
     instruction_file = st.file_uploader(
         "Upload instruction dataset (JSONL with instruction/input/output fields)",
@@ -255,8 +255,7 @@ elif page == "Stage 2: Instruction":
             with st.spinner("Running Stage 2..."):
                 result = run_instruction_stage(
                     config, instruction_config, data_path,
-                    stage1_adapter_dir=stage1_adapter or None,
-                    merged_model_dir=merged_model_dir or None,
+                    stage1_adapter_dir=stage1_adapter_dir,
                     status_callback=callback,
                 )
 
@@ -302,10 +301,21 @@ elif page == "Stage 3: Preference / DPO":
             preference_config.max_length = st.number_input("Max Sequence Length", min_value=128, value=preference_config.max_length, step=64)
             preference_config.adapter_dir = st.text_input("Adapter Output Directory", preference_config.adapter_dir, key="padapter")
 
-    merged_instruction_dir = st.text_input(
-        "Merged Instruction Model Directory (from Stage 2)",
-        value="./instruction_merged_model",
-    )
+    col1, col2 = st.columns(2)
+    with col1:
+        pref_stage1_adapter = st.text_input(
+            "Stage 1 Adapter Directory",
+            value="./adapter",
+            key="pref_s1",
+            help="Non-instruction LoRA adapter from Stage 1 (loaded frozen).",
+        )
+    with col2:
+        pref_stage2_adapter = st.text_input(
+            "Stage 2 Adapter Directory",
+            value="./instruction_adapter",
+            key="pref_s2",
+            help="Instruction-tuned LoRA adapter from Stage 2 (loaded frozen). A new trainable adapter is added on top for DPO.",
+        )
 
     preference_file = st.file_uploader(
         "Upload preference dataset (JSONL with prompt/chosen/rejected fields)",
@@ -343,7 +353,8 @@ elif page == "Stage 3: Preference / DPO":
             with st.spinner("Running Stage 3 (DPO)..."):
                 result = run_preference_stage(
                     config, preference_config, data_path,
-                    merged_instruction_dir,
+                    stage1_adapter_dir=pref_stage1_adapter,
+                    stage2_adapter_dir=pref_stage2_adapter,
                     status_callback=callback,
                 )
 

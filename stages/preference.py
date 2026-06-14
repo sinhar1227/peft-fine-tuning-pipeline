@@ -4,9 +4,13 @@
 # Direct Preference Optimization to align model responses
 # with human preferences using (prompt, chosen, rejected) triples.
 #
-# Merged Instruction Model (Stage 2)
+# Base Model
 #    +
-# New LoRA adapter for preference tuning (DPO)
+# Stage 1 LoRA Adapter (frozen, non-instruction)
+#    +
+# Stage 2 LoRA Adapter (frozen, instruction)
+#    +
+# Stage 3 LoRA Adapter (trainable, preference/DPO, saved)
 #
 # TRL provides DPOTrainer and DPOConfig for preference tuning.
 
@@ -15,7 +19,11 @@ from datasets import DatasetDict
 from config import Config, PreferenceConfig
 from data.dataset_builder import load_tokenizer
 from models.model_loader import get_device_info, load_base_model, clear_gpu_memory
-from models.lora_setup import create_lora_config, apply_lora
+from models.lora_setup import (
+    create_lora_config, apply_lora, load_first_adapter,
+    load_additional_adapter, add_new_trainable_adapter,
+    save_specific_adapter,
+)
 from models.inference import generate_preference_response
 from models.training_callback import LogHistoryCallback
 
@@ -24,7 +32,8 @@ def run_preference_stage(
     config: Config,
     preference_config: PreferenceConfig,
     preference_data_path: str,
-    merged_instruction_model_dir: str,
+    stage1_adapter_dir: str = None,
+    stage2_adapter_dir: str = None,
     status_callback=None,
 ):
     def log(msg):
@@ -54,14 +63,26 @@ def run_preference_stage(
     use_cuda, gpu_name = get_device_info()
     log(f"GPU: {use_cuda} ({gpu_name})")
 
-    # Load merged instruction model as base for preference tuning
-    log("Loading merged instruction model as base for DPO...")
-    base_model = load_base_model(merged_instruction_model_dir, use_cuda, trainable=True)
+    # Load base model and stack Stage 1 + Stage 2 adapters (frozen), then add new trainable adapter for preference
+    log(f"Loading base model from {config.model_name}...")
+    base_model = load_base_model(config.model_name, use_cuda, trainable=True, status_callback=status_callback)
 
-    # Create a new LoRA adapter for preference tuning
-    log("Creating LoRA adapter for preference tuning...")
-    lora_config = create_lora_config(r=16, lora_alpha=32, lora_dropout=0.05)
-    model = apply_lora(base_model, lora_config)
+    if stage1_adapter_dir and os.path.exists(stage1_adapter_dir) and stage2_adapter_dir and os.path.exists(stage2_adapter_dir):
+        log(f"Loading Stage 1 adapter from {stage1_adapter_dir}...")
+        model = load_first_adapter(base_model, stage1_adapter_dir, adapter_name="stage1", trainable=False)
+        log(f"Loading Stage 2 adapter from {stage2_adapter_dir}...")
+        model = load_additional_adapter(model, stage2_adapter_dir, adapter_name="stage2")
+        log("Adding new trainable adapter for preference tuning (stage3)...")
+        lora_config = create_lora_config(r=16, lora_alpha=32, lora_dropout=0.05)
+        model = add_new_trainable_adapter(model, lora_config, adapter_name="stage3")
+    elif stage2_adapter_dir and os.path.exists(stage2_adapter_dir):
+        log(f"Loading Stage 2 adapter from {stage2_adapter_dir} and continuing training...")
+        from models.lora_setup import load_lora_adapter
+        model = load_lora_adapter(base_model, stage2_adapter_dir, trainable=True)
+    else:
+        log("No prior adapters found, creating fresh LoRA for preference tuning...")
+        lora_config = create_lora_config(r=16, lora_alpha=32, lora_dropout=0.05)
+        model = apply_lora(base_model, lora_config)
     model.print_trainable_parameters()
 
     # Configure DPO training
@@ -100,7 +121,7 @@ def run_preference_stage(
         # DPO hyperparameter
         beta=preference_config.beta,
         max_length=preference_config.max_length,
-        max_prompt_length=preference_config.max_prompt_length,
+        #max_prompt_length=preference_config.max_prompt_length,
     )
 
     # Create log callback to capture real-time DPO training logs
@@ -116,7 +137,7 @@ def run_preference_stage(
         train_dataset=datasets["train"],
         eval_dataset=datasets["validation"],
         processing_class=tokenizer,
-        callbacks=[log_callback],
+        #callbacks=[log_callback],
     )
 
     # Start DPO preference tuning
@@ -124,10 +145,18 @@ def run_preference_stage(
     train_result = dpo_trainer.train()
     log("DPO preference tuning completed.")
 
-    # Save DPO preference-tuned LoRA adapter
+    # Save only the stage3 (preference) LoRA adapter
     os.makedirs(preference_config.adapter_dir, exist_ok=True)
-    log("Saving DPO LoRA adapter...")
-    dpo_trainer.model.save_pretrained(preference_config.adapter_dir)
+    has_stacked = (
+        stage1_adapter_dir and os.path.exists(stage1_adapter_dir) and
+        stage2_adapter_dir and os.path.exists(stage2_adapter_dir)
+    )
+    if has_stacked:
+        log("Saving preference LoRA adapter (stage3)...")
+        save_specific_adapter(dpo_trainer.model, preference_config.adapter_dir, adapter_name="stage3")
+    else:
+        log("Saving DPO LoRA adapter...")
+        dpo_trainer.model.save_pretrained(preference_config.adapter_dir)
     tokenizer.save_pretrained(preference_config.adapter_dir)
 
     return {

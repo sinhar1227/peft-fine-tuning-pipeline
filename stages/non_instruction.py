@@ -90,7 +90,7 @@ def run_non_instruction_stage(config: Config, pdf_path: str, status_callback=Non
 
     # Load base model (with 4-bit quantization if GPU available)
     log("Loading base model...")
-    base_model = load_base_model(config.model_name, use_cuda, trainable=True)
+    base_model = load_base_model(config.model_name, use_cuda, trainable=True, status_callback=status_callback)
 
     # Apply LoRA adapters
     # LoRA trains a small number of adapter parameters instead of updating all base model weights.

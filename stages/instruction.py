@@ -1,13 +1,16 @@
 # ============================================================
 # Stage 2: Instruction Fine-Tuning
 # ============================================================
-# We continue instruction fine-tuning from the non-instruction LoRA adapter.
+# We stack the Stage 1 (non-instruction) adapter as a frozen base
+# and add a new trainable LoRA adapter for instruction tuning.
 # The instruction dataset is loaded from a JSONL file, formatted into
 # Alpaca-style training text, tokenized, and used for causal LM training.
 #
-# Merged Stage 1 Model
+# Base Model
 #    +
-# New LoRA adapter for instruction tuning
+# Stage 1 LoRA Adapter (frozen)
+#    +
+# Stage 2 LoRA Adapter (trainable, saved)
 
 import os
 from datasets import Dataset, DatasetDict
@@ -17,8 +20,11 @@ from data.dataset_builder import (
     load_tokenizer, format_instruction_record, tokenize_instruction,
     build_instruction_prompt,
 )
-from models.model_loader import get_device_info, load_base_model, load_model_for_inference, clear_gpu_memory
-from models.lora_setup import create_lora_config, apply_lora, load_lora_adapter, merge_and_unload
+from models.model_loader import get_device_info, load_base_model, clear_gpu_memory
+from models.lora_setup import (
+    create_lora_config, apply_lora, load_first_adapter,
+    add_new_trainable_adapter, save_specific_adapter,
+)
 from models.inference import generate_instruction_response
 from models.training_callback import LogHistoryCallback
 
@@ -28,7 +34,6 @@ def run_instruction_stage(
     instruction_config: InstructionConfig,
     instruction_data_path: str,
     stage1_adapter_dir: str = None,
-    merged_model_dir: str = None,
     status_callback=None,
 ):
     def log(msg):
@@ -71,15 +76,21 @@ def run_instruction_stage(
     use_cuda, gpu_name = get_device_info()
     log(f"GPU: {use_cuda} ({gpu_name})")
 
-    # Load base model - either from merged Stage 1 model or from original model name
-    base_model_source = merged_model_dir if merged_model_dir else config.model_name
-    log(f"Loading base model from {base_model_source}...")
-    base_model = load_base_model(base_model_source, use_cuda, trainable=True)
+    # Load base model (always from original model name)
+    log(f"Loading base model from {config.model_name}...")
+    base_model = load_base_model(config.model_name, use_cuda, trainable=True, status_callback=status_callback)
 
-    # Create a new LoRA adapter for instruction fine-tuning
-    log("Creating LoRA adapter for instruction tuning...")
-    lora_config = create_lora_config(r=16, lora_alpha=32, lora_dropout=0.05)
-    model = apply_lora(base_model, lora_config)
+    # Load Stage 1 adapter (frozen) and add a new trainable adapter for instruction
+    if stage1_adapter_dir and os.path.exists(stage1_adapter_dir):
+        log(f"Loading Stage 1 adapter from {stage1_adapter_dir}...")
+        model = load_first_adapter(base_model, stage1_adapter_dir, adapter_name="stage1", trainable=False)
+        log("Adding new trainable adapter for instruction tuning...")
+        lora_config = create_lora_config(r=16, lora_alpha=32, lora_dropout=0.05)
+        model = add_new_trainable_adapter(model, lora_config, adapter_name="stage2")
+    else:
+        log("No Stage 1 adapter found, creating fresh LoRA for instruction tuning...")
+        lora_config = create_lora_config(r=16, lora_alpha=32, lora_dropout=0.05)
+        model = apply_lora(base_model, lora_config)
     model.print_trainable_parameters()
 
     # Instruction fine-tuning data collator
@@ -137,11 +148,15 @@ def run_instruction_stage(
     train_result = trainer.train()
     log("Instruction fine-tuning completed.")
 
-    # Save final instruction-tuned LoRA adapter
-    # This adapter now contains Stage 1 domain adaptation + Stage 2 instruction tuning.
+    # Save only the stage2 (instruction) LoRA adapter
+    # Stage 1 adapter remains separate for compositional inference.
     os.makedirs(instruction_config.adapter_dir, exist_ok=True)
-    log("Saving instruction LoRA adapter...")
-    trainer.model.save_pretrained(instruction_config.adapter_dir)
+    if stage1_adapter_dir and os.path.exists(stage1_adapter_dir):
+        log("Saving instruction LoRA adapter (stage2)...")
+        save_specific_adapter(trainer.model, instruction_config.adapter_dir, adapter_name="stage2")
+    else:
+        log("Saving LoRA adapter...")
+        trainer.model.save_pretrained(instruction_config.adapter_dir)
     tokenizer.save_pretrained(instruction_config.adapter_dir)
 
     return {

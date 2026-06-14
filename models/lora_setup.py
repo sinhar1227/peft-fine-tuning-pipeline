@@ -30,21 +30,42 @@ def create_lora_config(
 
 
 def apply_lora(model, lora_config):
-    # Apply the LoRA configuration on top of the base model.
     return get_peft_model(model, lora_config)
 
 
 def load_lora_adapter(base_model, adapter_dir: str, trainable: bool = False):
-    # Load a previously trained LoRA adapter onto a base model.
     return PeftModel.from_pretrained(base_model, adapter_dir, is_trainable=trainable)
 
 
 # ============================================================
-# 24. Optional merge step
+# Multi-Adapter Stacking (for compositional fine-tuning)
 # ============================================================
-# This step merges the LoRA adapter into the base model.
-# Use this only when you want a standalone model for deployment.
+
+def load_first_adapter(base_model, adapter_dir: str, adapter_name: str, trainable: bool = False):
+    return PeftModel.from_pretrained(base_model, adapter_dir, adapter_name=adapter_name, is_trainable=trainable)
+
+
+def load_additional_adapter(peft_model, adapter_dir: str, adapter_name: str):
+    peft_model.load_adapter(adapter_dir, adapter_name=adapter_name)
+    return peft_model
+
+
+def add_new_trainable_adapter(peft_model, lora_config, adapter_name: str):
+    peft_model.add_adapter(adapter_name, lora_config)
+    peft_model.set_adapter(adapter_name)
+    for name, param in peft_model.named_parameters():
+        param.requires_grad = adapter_name in name
+    return peft_model
+
+
+def save_specific_adapter(peft_model, save_dir: str, adapter_name: str):
+    peft_model.save_pretrained(save_dir, selected_adapters=[adapter_name])
+
+
+def compose_adapters(peft_model, adapter_names: list):
+    peft_model.set_adapter(adapter_names)
+    peft_model.eval()
+
 
 def merge_and_unload(model_with_adapter):
-    # Merge LoRA adapter weights into the base model weights.
     return model_with_adapter.merge_and_unload()
