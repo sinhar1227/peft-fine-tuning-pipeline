@@ -165,9 +165,8 @@ class PreferenceConfig:
     # toward chosen answers over rejected answers.
     beta: float = 0.1
 
-    # Sequence length settings.
+    # Sequence length setting.
     max_length: int = 512
-    max_prompt_length: int = 256
 
     output_dir: str = "./preference_output"
     adapter_dir: str = "./preference_adapter"

@@ -20,9 +20,9 @@ from config import Config, PreferenceConfig
 from data.dataset_builder import load_tokenizer
 from models.model_loader import get_device_info, load_base_model, clear_gpu_memory
 from models.lora_setup import (
-    create_lora_config, apply_lora, load_first_adapter,
-    load_additional_adapter, add_new_trainable_adapter,
-    save_specific_adapter,
+    create_lora_config, apply_lora, load_lora_adapter,
+    load_first_adapter, load_additional_adapter,
+    add_new_trainable_adapter, save_specific_adapter,
 )
 from models.inference import generate_preference_response
 from models.training_callback import LogHistoryCallback
@@ -68,16 +68,15 @@ def run_preference_stage(
     base_model = load_base_model(config.model_name, use_cuda, trainable=True, status_callback=status_callback)
 
     if stage1_adapter_dir and os.path.exists(stage1_adapter_dir) and stage2_adapter_dir and os.path.exists(stage2_adapter_dir):
-        log(f"Loading Stage 1 adapter from {stage1_adapter_dir}...")
-        model = load_first_adapter(base_model, stage1_adapter_dir, adapter_name="stage1", trainable=False)
-        log(f"Loading Stage 2 adapter from {stage2_adapter_dir}...")
+        log(f"Loading Stage 1 adapter from {stage1_adapter_dir} (as 'default')...")
+        model = load_first_adapter(base_model, stage1_adapter_dir, adapter_name="default", trainable=False)
+        log(f"Loading Stage 2 adapter from {stage2_adapter_dir} (as 'stage2')...")
         model = load_additional_adapter(model, stage2_adapter_dir, adapter_name="stage2")
-        log("Adding new trainable adapter for preference tuning (stage3)...")
+        log("Adding new trainable adapter for preference tuning (as 'stage3')...")
         lora_config = create_lora_config(r=16, lora_alpha=32, lora_dropout=0.05)
         model = add_new_trainable_adapter(model, lora_config, adapter_name="stage3")
     elif stage2_adapter_dir and os.path.exists(stage2_adapter_dir):
         log(f"Loading Stage 2 adapter from {stage2_adapter_dir} and continuing training...")
-        from models.lora_setup import load_lora_adapter
         model = load_lora_adapter(base_model, stage2_adapter_dir, trainable=True)
     else:
         log("No prior adapters found, creating fresh LoRA for preference tuning...")
@@ -99,6 +98,9 @@ def run_preference_stage(
         per_device_train_batch_size=preference_config.per_device_train_batch_size,
         per_device_eval_batch_size=preference_config.per_device_eval_batch_size,
         gradient_accumulation_steps=preference_config.gradient_accumulation_steps,
+        # Disable gradient checkpointing to avoid dynamic shape conflicts
+        # between prompt+chosen and prompt+rejected sequences in DPO
+        gradient_checkpointing=False,
         # Optimizer settings
         learning_rate=preference_config.learning_rate,
         warmup_steps=preference_config.warmup_steps,
@@ -121,7 +123,6 @@ def run_preference_stage(
         # DPO hyperparameter
         beta=preference_config.beta,
         max_length=preference_config.max_length,
-        #max_prompt_length=preference_config.max_prompt_length,
     )
 
     # Create log callback to capture real-time DPO training logs
@@ -137,8 +138,21 @@ def run_preference_stage(
         train_dataset=datasets["train"],
         eval_dataset=datasets["validation"],
         processing_class=tokenizer,
-        #callbacks=[log_callback],
+        callbacks=[log_callback],
     )
+
+    # PEFT 0.19.1's add_adapter calls set_adapter internally, so DPOTrainer's
+    # creation of the "ref" adapter at __init__ line 93 switched the active
+    # adapter away from our trainable one. Restore it.
+    trainable_adapter = None
+    if stage1_adapter_dir and os.path.exists(stage1_adapter_dir) and stage2_adapter_dir and os.path.exists(stage2_adapter_dir):
+        trainable_adapter = "stage3"
+    else:
+        # Fallback (stage2-only or fresh LoRA) — adapter defaults to "default"
+        trainable_adapter = "default"
+    if trainable_adapter in dpo_trainer.model.peft_config:
+        dpo_trainer.model.set_adapter(trainable_adapter)
+        dpo_trainer.model.train()
 
     # Start DPO preference tuning
     log("Starting DPO preference tuning...")
